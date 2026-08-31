@@ -1860,3 +1860,213 @@ fn test_reindex_attestation_reports_still_unavailable_indexer() {
     let res = sas_client.try_reindex_attestation(&uid);
     assert_eq!(res, Err(Ok(SASError::IndexerUnavailable.into())));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #158 — Resolver callback failure aborts issuance
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub mod mock_reject_resolver {
+    use super::*;
+    #[contract]
+    pub struct RejectResolver;
+
+    #[contractimpl]
+    impl RejectResolver {
+        pub fn on_attest(_env: Env, _attestation: Attestation) {
+            soroban_sdk::panic_with_error!(&_env, SASError::InvalidSchema);
+        }
+        pub fn SASREG(_env: Env) -> bool {
+            true
+        }
+        pub fn get_schema(_env: Env, _uid: UID) -> Option<soroban_sas_common::SchemaRecord> {
+            None
+        }
+    }
+}
+
+pub mod mock_reject_registry {
+    use super::*;
+    #[contract]
+    pub struct RejectRegistry;
+
+    #[contractimpl]
+    impl RejectRegistry {
+        pub fn on_attest(_env: Env, _attestation: Attestation) {}
+        pub fn SASREG(_env: Env) -> bool {
+            true
+        }
+        pub fn get_schema(env: Env, uid: UID) -> Option<soroban_sas_common::SchemaRecord> {
+            let resolver =
+                env.register_contract(None, mock_reject_resolver::RejectResolver);
+            Some(soroban_sas_common::SchemaRecord {
+                uid,
+                resolver,
+                revocable: true,
+                schema: soroban_sdk::String::from_str(&env, "bool like"),
+            })
+        }
+    }
+}
+
+#[test]
+fn test_resolver_failure_aborts_issuance() {
+    let env = Env::default();
+    let registry_id = env.register_contract(None, mock_reject_registry::RejectRegistry);
+    let sas_id = env.register_contract(None, SAS);
+    let sas_client = SASClient::new(&env, &sas_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    sas_client.init(&admin, &registry_id);
+
+    let attester = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let attestation = attestation_fixture(&env, &attester, &recipient, [60u8; 32]);
+
+    let res = sas_client.try_attest(&attestation);
+    assert!(res.is_err());
+    assert!(!sas_client.verify_attestation(&attestation.uid));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #159 — ref_uid integrity rules
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_attest_rejects_self_reference() {
+    let env = Env::default();
+    let registry_id = env.register_contract(None, mock1::MockRegistry);
+    let sas_id = env.register_contract(None, SAS);
+    let sas_client = SASClient::new(&env, &sas_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    sas_client.init(&admin, &registry_id);
+
+    let attester = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let uid = UID(soroban_sdk::BytesN::from_array(&env, &[70u8; 32]));
+    let attestation = Attestation {
+        uid: uid.clone(),
+        schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
+        time: 1000,
+        expiration_time: 0,
+        revocation_time: 0,
+        ref_uid: uid.clone(), // self-reference
+        recipient,
+        attester,
+        revocable: true,
+        data: Bytes::new(&env),
+    };
+
+    let res = sas_client.try_attest(&attestation);
+    assert_eq!(res, Err(Ok(SASError::InvalidRefUid.into())));
+}
+
+#[test]
+fn test_attest_rejects_nonexistent_ref() {
+    let env = Env::default();
+    let registry_id = env.register_contract(None, mock1::MockRegistry);
+    let sas_id = env.register_contract(None, SAS);
+    let sas_client = SASClient::new(&env, &sas_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    sas_client.init(&admin, &registry_id);
+
+    let attester = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let nonexistent = UID(soroban_sdk::BytesN::from_array(&env, &[99u8; 32]));
+    let attestation = Attestation {
+        uid: UID(soroban_sdk::BytesN::from_array(&env, &[71u8; 32])),
+        schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
+        time: 1000,
+        expiration_time: 0,
+        revocation_time: 0,
+        ref_uid: nonexistent,
+        recipient,
+        attester,
+        revocable: true,
+        data: Bytes::new(&env),
+    };
+
+    let res = sas_client.try_attest(&attestation);
+    assert_eq!(res, Err(Ok(SASError::InvalidRefUid.into())));
+}
+
+#[test]
+fn test_attest_accepts_valid_ref_to_existing_attestation() {
+    let env = Env::default();
+    let registry_id = env.register_contract(None, mock1::MockRegistry);
+    let sas_id = env.register_contract(None, SAS);
+    let sas_client = SASClient::new(&env, &sas_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    sas_client.init(&admin, &registry_id);
+
+    let attester = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let ref_uid = UID(soroban_sdk::BytesN::from_array(&env, &[80u8; 32]));
+    let ref_att = attestation_fixture(&env, &attester, &recipient, [80u8; 32]);
+    sas_client.attest(&ref_att);
+
+    let attestation = Attestation {
+        uid: UID(soroban_sdk::BytesN::from_array(&env, &[81u8; 32])),
+        schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
+        time: 1000,
+        expiration_time: 0,
+        revocation_time: 0,
+        ref_uid,
+        recipient,
+        attester,
+        revocable: true,
+        data: Bytes::new(&env),
+    };
+
+    let uid = sas_client.attest(&attestation);
+    assert_eq!(uid, attestation.uid);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #160 — TTL aligned with expiration semantics
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_expiring_attestation_is_stored_with_extended_ttl() {
+    let env = Env::default();
+    let registry_id = env.register_contract(None, mock1::MockRegistry);
+    let sas_id = env.register_contract(None, SAS);
+    let sas_client = SASClient::new(&env, &sas_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    sas_client.init(&admin, &registry_id);
+
+    let attester = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().with_mut(|li| li.timestamp = 1000);
+
+    let mut attestation = attestation_fixture(&env, &attester, &recipient, [90u8; 32]);
+    attestation.expiration_time = 315_361_000;
+
+    sas_client.attest(&attestation);
+    assert!(sas_client.verify_attestation(&attestation.uid));
+    assert!(sas_client.get_attestation(&attestation.uid).is_some());
+}
+
+#[test]
+fn test_non_expiring_attestation_stored_successfully() {
+    let env = Env::default();
+    let registry_id = env.register_contract(None, mock1::MockRegistry);
+    let sas_id = env.register_contract(None, SAS);
+    let sas_client = SASClient::new(&env, &sas_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    sas_client.init(&admin, &registry_id);
+
+    let attester = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let attestation = attestation_fixture(&env, &attester, &recipient, [91u8; 32]);
+    sas_client.attest(&attestation);
+    assert!(sas_client.verify_attestation(&attestation.uid));
+    assert!(sas_client.get_attestation(&attestation.uid).is_some());
+}
