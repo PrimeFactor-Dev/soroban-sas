@@ -42,4 +42,6 @@ pub enum SASError {
     /// A bound Indexer could not be invoked and the contract is configured to
     /// fail closed on indexing errors (#161).
     IndexerUnavailable = 407,
+    /// `ref_uid` points to the attestation itself or a nonexistent attestation.
+    InvalidRefUid = 408,
 }
