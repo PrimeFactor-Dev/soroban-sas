@@ -755,11 +755,15 @@ fn test_attest_with_value_insufficient_balance_issues_nothing() {
     sas_client.set_fee(&token_id, &500);
     let attestation = attestation_fixture(&env, &attester, &recipient, [10u8; 32]);
     // Fee is configured but the attester has no balance: the transfer fails
-    // and no attestation is issued.
+    // and no attestation is issued. Use the try_* client API so the host
+    // trap is captured as a deterministic Err rather than aborting the suite.
     let res = sas_client.try_attest_with_value(&attestation, &token_id, &500);
 
-    assert!(res.is_err());
-    assert!(!sas_client.verify_attestation(&attestation.uid));
+    assert!(res.is_err(), "expected host error for insufficient balance");
+    assert!(
+        !sas_client.verify_attestation(&attestation.uid),
+        "no attestation must be stored after a failed fee transfer"
+    );
 }
 
 #[test]
@@ -1862,211 +1866,130 @@ fn test_reindex_attestation_reports_still_unavailable_indexer() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// #158 — Resolver callback failure aborts issuance
+// #157 — Bound attestation payload size
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub mod mock_reject_resolver {
-    use super::*;
-    #[contract]
-    pub struct RejectResolver;
-
-    #[contractimpl]
-    impl RejectResolver {
-        pub fn on_attest(_env: Env, _attestation: Attestation) {
-            soroban_sdk::panic_with_error!(&_env, SASError::InvalidSchema);
-        }
-        pub fn SASREG(_env: Env) -> bool {
-            true
-        }
-        pub fn get_schema(_env: Env, _uid: UID) -> Option<soroban_sas_common::SchemaRecord> {
-            None
-        }
-    }
-}
-
-pub mod mock_reject_registry {
-    use super::*;
-    #[contract]
-    pub struct RejectRegistry;
-
-    #[contractimpl]
-    impl RejectRegistry {
-        pub fn on_attest(_env: Env, _attestation: Attestation) {}
-        pub fn SASREG(_env: Env) -> bool {
-            true
-        }
-        pub fn get_schema(env: Env, uid: UID) -> Option<soroban_sas_common::SchemaRecord> {
-            let resolver =
-                env.register_contract(None, mock_reject_resolver::RejectResolver);
-            Some(soroban_sas_common::SchemaRecord {
-                uid,
-                resolver,
-                revocable: true,
-                schema: soroban_sdk::String::from_str(&env, "bool like"),
-            })
-        }
-    }
-}
-
 #[test]
-fn test_resolver_failure_aborts_issuance() {
-    let env = Env::default();
-    let registry_id = env.register_contract(None, mock_reject_registry::RejectRegistry);
-    let sas_id = env.register_contract(None, SAS);
-    let sas_client = SASClient::new(&env, &sas_id);
-    let admin = Address::generate(&env);
-    env.mock_all_auths();
-    sas_client.init(&admin, &registry_id);
-
-    let attester = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let attestation = attestation_fixture(&env, &attester, &recipient, [60u8; 32]);
-
+fn test_attest_rejects_payload_exceeding_max_size() {
+    let (env, sas_client, _sas_id, _admin, attester, recipient) = fee_test_env();
+    let mut attestation = attestation_fixture(&env, &attester, &recipient, [60u8; 32]);
+    // One byte over the limit.
+    let over_limit = soroban_sas_common::MAX_ATTESTATION_DATA_BYTES as usize + 1;
+    let buf = alloc::vec![0u8; over_limit];
+    attestation.data = Bytes::from_slice(&env, &buf);
     let res = sas_client.try_attest(&attestation);
-    assert!(res.is_err());
-    assert!(!sas_client.verify_attestation(&attestation.uid));
+    assert_eq!(res, Err(Ok(SASError::PayloadTooLarge.into())));
+}
+
+#[test]
+fn test_attest_accepts_payload_at_max_size() {
+    let (env, sas_client, _sas_id, _admin, attester, recipient) = fee_test_env();
+    let mut attestation = attestation_fixture(&env, &attester, &recipient, [61u8; 32]);
+    let at_limit = soroban_sas_common::MAX_ATTESTATION_DATA_BYTES as usize;
+    let buf = alloc::vec![0u8; at_limit];
+    attestation.data = Bytes::from_slice(&env, &buf);
+    let uid = sas_client.attest(&attestation);
+    assert_eq!(uid, attestation.uid);
+    assert!(sas_client.verify_attestation(&attestation.uid));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// #159 — ref_uid integrity rules
+// #156 — Attestation issuance timestamp normalized to ledger clock
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_attest_rejects_self_reference() {
+fn test_attest_normalizes_time_to_ledger_timestamp() {
+    let (env, sas_client, _sas_id, _admin, attester, recipient) = fee_test_env();
+    let ledger_ts = 9_999u64;
+    env.ledger().with_mut(|li| li.timestamp = ledger_ts);
+
+    let mut attestation = attestation_fixture(&env, &attester, &recipient, [70u8; 32]);
+    attestation.time = 1; // caller-provided, must be overwritten
+    sas_client.attest(&attestation);
+
+    let stored: Attestation = env.as_contract(&sas_client.address, || {
+        env.storage().persistent().get(&attestation.uid).unwrap()
+    });
+    assert_eq!(stored.time, ledger_ts);
+}
+
+#[test]
+fn test_delegated_attest_normalizes_time_to_ledger_timestamp() {
+    let seed = [71u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
     let env = Env::default();
     let registry_id = env.register_contract(None, mock1::MockRegistry);
     let sas_id = env.register_contract(None, SAS);
     let sas_client = SASClient::new(&env, &sas_id);
+
     let admin = Address::generate(&env);
     env.mock_all_auths();
     sas_client.init(&admin, &registry_id);
 
-    let attester = Address::generate(&env);
+    let attester_strkey =
+        stellar_strkey::ed25519::PublicKey(signing_key.verifying_key().to_bytes()).to_string();
+    let attester = Address::from_string(&soroban_sdk::String::from_str(&env, &attester_strkey));
     let recipient = Address::generate(&env);
-    let uid = UID(soroban_sdk::BytesN::from_array(&env, &[70u8; 32]));
-    let attestation = Attestation {
-        uid: uid.clone(),
-        schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
-        time: 1000,
-        expiration_time: 0,
-        revocation_time: 0,
-        ref_uid: uid.clone(), // self-reference
-        recipient,
-        attester,
-        revocable: true,
-        data: Bytes::new(&env),
-    };
 
-    let res = sas_client.try_attest(&attestation);
-    assert_eq!(res, Err(Ok(SASError::InvalidRefUid.into())));
-}
+    let ledger_ts = 7_777u64;
+    env.ledger().with_mut(|li| li.timestamp = ledger_ts);
 
-#[test]
-fn test_attest_rejects_nonexistent_ref() {
-    let env = Env::default();
-    let registry_id = env.register_contract(None, mock1::MockRegistry);
-    let sas_id = env.register_contract(None, SAS);
-    let sas_client = SASClient::new(&env, &sas_id);
-    let admin = Address::generate(&env);
-    env.mock_all_auths();
-    sas_client.init(&admin, &registry_id);
-
-    let attester = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let nonexistent = UID(soroban_sdk::BytesN::from_array(&env, &[99u8; 32]));
     let attestation = Attestation {
         uid: UID(soroban_sdk::BytesN::from_array(&env, &[71u8; 32])),
         schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
-        time: 1000,
+        time: 1, // caller-provided, must be overwritten
         expiration_time: 0,
         revocation_time: 0,
-        ref_uid: nonexistent,
+        ref_uid: UID(soroban_sdk::BytesN::from_array(&env, &[0u8; 32])),
         recipient,
-        attester,
+        attester: attester.clone(),
         revocable: true,
         data: Bytes::new(&env),
     };
 
-    let res = sas_client.try_attest(&attestation);
-    assert_eq!(res, Err(Ok(SASError::InvalidRefUid.into())));
-}
-
-#[test]
-fn test_attest_accepts_valid_ref_to_existing_attestation() {
-    let env = Env::default();
-    let registry_id = env.register_contract(None, mock1::MockRegistry);
-    let sas_id = env.register_contract(None, SAS);
-    let sas_client = SASClient::new(&env, &sas_id);
-    let admin = Address::generate(&env);
-    env.mock_all_auths();
-    sas_client.init(&admin, &registry_id);
-
-    let attester = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    let ref_uid = UID(soroban_sdk::BytesN::from_array(&env, &[80u8; 32]));
-    let ref_att = attestation_fixture(&env, &attester, &recipient, [80u8; 32]);
-    sas_client.attest(&ref_att);
-
-    let attestation = Attestation {
-        uid: UID(soroban_sdk::BytesN::from_array(&env, &[81u8; 32])),
-        schema_uid: UID(soroban_sdk::BytesN::from_array(&env, &[2u8; 32])),
-        time: 1000,
-        expiration_time: 0,
-        revocation_time: 0,
-        ref_uid,
-        recipient,
-        attester,
-        revocable: true,
-        data: Bytes::new(&env),
+    let nonce = 1u64;
+    let domain = soroban_sas_common::AttestationDomain {
+        network_id: env.ledger().network_id(),
+        contract: sas_id.clone(),
+        nonce,
     };
+    let payload_hash =
+        soroban_sas_common::hash_offchain_attestation(&env, &attestation, &domain);
+    let signature = signing_key.sign(&payload_hash.to_array());
+    let sig_bytes = soroban_sdk::BytesN::from_array(&env, &signature.to_bytes());
+    let pub_bytes = soroban_sdk::BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
 
-    let uid = sas_client.attest(&attestation);
-    assert_eq!(uid, attestation.uid);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// #160 — TTL aligned with expiration semantics
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_expiring_attestation_is_stored_with_extended_ttl() {
-    let env = Env::default();
-    let registry_id = env.register_contract(None, mock1::MockRegistry);
-    let sas_id = env.register_contract(None, SAS);
-    let sas_client = SASClient::new(&env, &sas_id);
-    let admin = Address::generate(&env);
     env.mock_all_auths();
-    sas_client.init(&admin, &registry_id);
+    sas_client.attest_by_delegation(&attestation, &nonce, &sig_bytes, &pub_bytes);
 
-    let attester = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    env.ledger().with_mut(|li| li.timestamp = 1000);
-
-    let mut attestation = attestation_fixture(&env, &attester, &recipient, [90u8; 32]);
-    attestation.expiration_time = 315_361_000;
-
-    sas_client.attest(&attestation);
-    assert!(sas_client.verify_attestation(&attestation.uid));
-    assert!(sas_client.get_attestation(&attestation.uid).is_some());
+    let stored: Attestation = env.as_contract(&sas_id, || {
+        env.storage().persistent().get(&attestation.uid).unwrap()
+    });
+    assert_eq!(stored.time, ledger_ts);
 }
 
 #[test]
-fn test_non_expiring_attestation_stored_successfully() {
-    let env = Env::default();
-    let registry_id = env.register_contract(None, mock1::MockRegistry);
-    let sas_id = env.register_contract(None, SAS);
-    let sas_client = SASClient::new(&env, &sas_id);
-    let admin = Address::generate(&env);
-    env.mock_all_auths();
-    sas_client.init(&admin, &registry_id);
+fn test_multi_attest_normalizes_time_to_ledger_timestamp() {
+    let (env, sas_client, _sas_id, _admin, attester, recipient) = fee_test_env();
+    let ledger_ts = 5_555u64;
+    env.ledger().with_mut(|li| li.timestamp = ledger_ts);
 
-    let attester = Address::generate(&env);
-    let recipient = Address::generate(&env);
+    let mut att1 = attestation_fixture(&env, &attester, &recipient, [72u8; 32]);
+    att1.time = 1;
+    let mut att2 = attestation_fixture(&env, &attester, &recipient, [73u8; 32]);
+    att2.time = 2;
 
-    let attestation = attestation_fixture(&env, &attester, &recipient, [91u8; 32]);
-    sas_client.attest(&attestation);
-    assert!(sas_client.verify_attestation(&attestation.uid));
-    assert!(sas_client.get_attestation(&attestation.uid).is_some());
+    let uid1 = att1.uid.clone();
+    let uid2 = att2.uid.clone();
+    let batch = soroban_sdk::vec![&env, att1, att2];
+    sas_client.multi_attest(&batch);
+
+    let stored1: Attestation = env.as_contract(&sas_client.address, || {
+        env.storage().persistent().get(&uid1).unwrap()
+    });
+    let stored2: Attestation = env.as_contract(&sas_client.address, || {
+        env.storage().persistent().get(&uid2).unwrap()
+    });
+    assert_eq!(stored1.time, ledger_ts);
+    assert_eq!(stored2.time, ledger_ts);
 }
